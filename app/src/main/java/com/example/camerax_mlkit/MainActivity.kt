@@ -38,7 +38,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import android.content.ContentValues
 import android.annotation.SuppressLint
-import com.google.android.material.dialog.MaterialAlertDialogBuilder // 상단에 import 추가
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import androidx.appcompat.app.AlertDialog
 
 class MainActivity : AppCompatActivity() {
@@ -67,6 +67,8 @@ class MainActivity : AppCompatActivity() {
 
     // 결제 여부 다이얼로그 상태
     @Volatile private var payChoiceDialogShowing = false
+    @Volatile private var locationDialogShowing = false
+
 
     /** TriggerGate → (브로드캐스트) → 여기서 라우터로 연결 */
     private val payPromptReceiver = object : BroadcastReceiver() {
@@ -81,9 +83,14 @@ class MainActivity : AppCompatActivity() {
 
             Log.d(TAG, "PAY_PROMPT(broadcast) → reason=$reason geo=$geo beacon=$beacon wifi=$wifi fence=$fenceId")
 
+            // 🔒 위치 OFF면 라우팅 금지 (우선 위치 유도)
+            if (!isLocationEnabled()) {
+                showLocationOnlyDialog()
+                return
+            }
             // 🔒 BT OFF면 라우팅 금지
             if (!isBtOn()) {
-                showBtOnlyDialog()
+                showPayChoiceDialog()
                 return
             }
             // 🔒 plainCamera는 라우팅 금지
@@ -126,6 +133,39 @@ class MainActivity : AppCompatActivity() {
         return PendingIntent.getBroadcast(this, GEOFENCE_REQ_CODE, intent, flags)
     }
 
+    private fun showLocationOnlyDialog() {
+        if (locationDialogShowing) return
+        locationDialogShowing = true
+
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle("위치 서비스를 켜주세요.")
+            .setMessage("위치가 꺼져 있어 매장 선택 및 QR 결제를 진행할 수 없습니다.")
+            .setPositiveButton("활성화") { d, _ ->
+                try { startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) }
+                catch (_: Exception) {
+                    Toast.makeText(this, "위치 설정 화면을 열 수 없습니다.", Toast.LENGTH_LONG).show()
+                }
+                d.dismiss()
+            }
+            .setNegativeButton("취소") { d, _ -> d.dismiss() }
+            .setOnDismissListener { locationDialogShowing = false }
+            .create() // ◀◀◀ .create()로 변경
+
+        dialog.show()
+
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.let { btn ->
+            btn.isAllCaps = false
+            btn.setTextColor(ContextCompat.getColor(this, android.R.color.black))
+        }
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.let { btn ->
+            btn.isAllCaps = false
+            btn.setTextColor(ContextCompat.getColor(this, android.R.color.black))
+        }
+    }
+
+
+
+
     // BLE 권한 런처
     private val blePermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -156,6 +196,8 @@ class MainActivity : AppCompatActivity() {
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
             routeToStoreSelectionSoon("BT_ON_FROM_DIALOG")
         }
+
+
 
     // ───────── Lifecycle ─────────
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -231,50 +273,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     // BT 전용 차단 다이얼로그 (선택지: 블루투스 켜기만)
-    private fun showBtOnlyDialog() {
-        if (payChoiceDialogShowing) return
-        payChoiceDialogShowing = true
-        // ▼ 수정된 부분: MaterialAlertDialogBuilder 사용
-        val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
-            .setTitle("결제를 진행하려면 블루투스를 켜주세요.")
-            .setMessage("블루투스가 꺼져 있어 QR 결제를 진행할 수 없습니다.")
-            .setPositiveButton("활성화") { d, _ ->
-                openBluetoothEnableScreen()
-                d.dismiss()
-            }
-            .setNegativeButton("취소") { d, _ -> d.dismiss() }
-            .setOnDismissListener { payChoiceDialogShowing = false }
-            .create()
-
-        dialog.show()
-
-        // ▼ 추가된 주석:
-        // MaterialAlertDialogBuilder를 사용하면 버튼 색상이 테마(아마도 colorPrimary)에 맞게
-        // 자동으로 설정될 수 있습니다.
-        // 만약 빌더 변경 후 버튼이 잘 보인다면, 아래의 색상 강제 지정 코드는 제거해도 좋습니다.
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.let { btn ->
-            btn.isAllCaps = false
-            btn.setTextColor(ContextCompat.getColor(this, android.R.color.black)) // 필요 색상으로
-        }
-        dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.let { btn ->
-            btn.isAllCaps = false
-            btn.setTextColor(ContextCompat.getColor(this, android.R.color.black))
-        }
-
-    }
 
     override fun onResume() {
         super.onResume()
         TriggerGate.onAppResumed(applicationContext)
 
-        // ✅ plain 카메라 모드가 아닐 때, BT OFF면 즉시 요구
-        if (!plainCameraMode && !isBtOn()) {
-            // 라우팅/자동동작보다 먼저 가로채기
-            showBtOnlyDialog()
-            return
+        if (!plainCameraMode) {
+            // 1) 위치 먼저 확인
+            if (!isLocationEnabled()) {
+                showLocationOnlyDialog()
+                return
+            }
+            // 2) BT 확인
+            if (!isBtOn()) {
+                showPayChoiceDialog()
+                return
+            }
         }
         scheduleInitialRoutingIfNeeded()
     }
+
 
     override fun onStop() {
         super.onStop()
@@ -323,22 +341,22 @@ class MainActivity : AppCompatActivity() {
                     return@MlKitAnalyzer
                 }
 
-                // 2) BT/GPS 꺼짐 → 결제 여부 선택지
-                if (!isBtOn() || !isLocationEnabled()) {
-                    showPayChoiceDialog(raw)
+                // 2) 위치/GPS OFF → 진행 금지 + 위치 팝업
+                if (!isLocationEnabled()) {
+                    showLocationOnlyDialog()
+                    return@MlKitAnalyzer
+                }
+                // 2-1) BT OFF → 진행 금지 + BT/카메라 선택 팝업(목록형)
+                if (!isBtOn()) {
+                    showPayChoiceDialog(raw)   // ← raw 전달해서 회색(미사용) 문제 해결
                     return@MlKitAnalyzer
                 }
 
                 // 3) 정상 컨텍스트면 결제 플로우
                 if (!scannerOnlyMode && !TriggerGate.allowedForQr()) return@MlKitAnalyzer
 
-                // ✅ 최종 하드 게이트: BT가 꺼져 있으면 결제로 절대 진입 금지
-                if (!isBtOn()) {
-                    showBtOnlyDialog()   // ← 아래 #3 새 함수
-                    return@MlKitAnalyzer
-                }
-
                 startPaymentPrompt(raw)
+
             }
         )
         controller.bindToLifecycle(this)
@@ -410,6 +428,27 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    // BT가 OFF인데 스캔 콘텐츠(raw)가 없는 상황(라우팅/복귀 등)에서 쓰는 버전
+    private fun showPayChoiceDialog() {
+        if (payChoiceDialogShowing) return
+        payChoiceDialogShowing = true
+
+        val items = arrayOf("결제를 진행(블루투스 켜기)", "카메라 사용하기(결제 안함)")
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("결제하시겠습니까? 블루투스가 꺼져 있습니다.")
+            .setItems(items) { dialog, which ->
+                when (which) {
+                    0 -> openBluetoothEnableScreen()
+                    1 -> openPlainCameraFromHere()
+                }
+                dialog.dismiss()
+            }
+            .setOnDismissListener { payChoiceDialogShowing = false }
+            .setCancelable(true)
+            .show()
+    }
+
+
     /** 가능한 경우 ACTION_REQUEST_ENABLE, 불가하면 설정화면으로 */
     private fun openBluetoothEnableScreen() {
         val adapter = BluetoothAdapter.getDefaultAdapter()
@@ -433,7 +472,7 @@ class MainActivity : AppCompatActivity() {
 
         // ✅ BT OFF면 결제 화면 진입 자체 차단
         if (!isBtOn()) {
-            showBtOnlyDialog()
+            showPayChoiceDialog()
             return
         }
 
@@ -524,7 +563,7 @@ class MainActivity : AppCompatActivity() {
 
         // 🔒 BT OFF or GPS OFF면 라우팅 금지
         if (!isBtOn() || !isLocationEnabled()) {
-            if (!isBtOn()) showBtOnlyDialog()
+            if (!isBtOn())     showPayChoiceDialog()
             return
         }
 
@@ -556,7 +595,7 @@ class MainActivity : AppCompatActivity() {
 
         // 🔒 마지막 관문: BT/GPS 검증
         if (!isBtOn() || !isLocationEnabled()) {
-            if (!isBtOn()) showBtOnlyDialog()
+            if (!isBtOn())     showPayChoiceDialog()
             return
         }
 
@@ -584,17 +623,14 @@ class MainActivity : AppCompatActivity() {
 
         settingsClient.checkLocationSettings(req)
             .addOnSuccessListener { onReady() }
+// 위치 설정이 꺼져있을 때(실패) 시스템 팝업을 띄우는 대신,
+            // 로그만 남기고 아무것도 하지 않습니다.
+            // 어차피 onResume()에서 isLocationEnabled() 체크를 통해
+            // 우리가 만든 showLocationOnlyDialog()가 뜰 것입니다.
             .addOnFailureListener { e ->
-                if (e is ResolvableApiException) {
-                    try { e.startResolutionForResult(this, RC_RESOLVE_LOCATION) }
-                    catch (t: Throwable) {
-                        Log.e(TAG, "Location settings resolution 실패", t)
-                        Toast.makeText(this, "위치 설정을 켜주세요.", Toast.LENGTH_LONG).show()
-                    }
-                } else {
-                    Log.e(TAG, "Location settings check 실패", e)
-                    Toast.makeText(this, "위치 설정을 켜주세요.", Toast.LENGTH_LONG).show()
-                }
+                Log.w(TAG, "Location settings check failed, but system popup is disabled. 'onResume' will handle UI.", e)
+                // (e is ResolvableApiException) 관련 로직 전체 삭제
+                // onReady()를 호출하지 않음 (지오펜스 등록을 시도하지 않음)
             }
     }
 
